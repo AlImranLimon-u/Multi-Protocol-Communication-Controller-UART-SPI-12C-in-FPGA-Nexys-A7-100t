@@ -1,0 +1,98 @@
+`timescale 1ns / 1ps
+//=================================================================
+// 7-Segment Display Controller - Nexys A7-100T
+// 8 digits, common anode, active-low segments
+// Display format:  P r o - [U/S/C] [blank] [HH] [LL]
+//                  7 6 5 4    3       2      1    0
+// HH = received byte high nibble (hex)
+// LL = received byte low  nibble (hex)
+// Protocol letter: U=UART  S=SPI  C=I2C
+//=================================================================
+module seg7_ctrl (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [1:0]  proto_sel,
+    input  wire [7:0]  rx_byte,
+    input  wire        rx_new,
+    output reg  [7:0]  an,
+    output reg  [7:0]  seg
+);
+
+    // Refresh counter - cycles all 8 digits at ~1 kHz each
+    reg [19:0] refresh_cnt;
+    reg [2:0]  digit_sel;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            refresh_cnt <= 20'd0;
+            digit_sel   <= 3'd0;
+        end else if (refresh_cnt >= 20'd99999) begin
+            refresh_cnt <= 20'd0;
+            digit_sel   <= digit_sel + 1;
+        end else
+            refresh_cnt <= refresh_cnt + 1;
+    end
+
+    // Latch received byte
+    reg [7:0] disp_byte;
+    always @(posedge clk) begin
+        if (rst)         disp_byte <= 8'h00;
+        else if (rx_new) disp_byte <= rx_byte;
+    end
+
+    // 4-bit hex to 7-segment (active low, segments CA-CG)
+    function [6:0] hex_seg;
+        input [3:0] n;
+        case (n)
+            4'h0: hex_seg = 7'b0000001;
+            4'h1: hex_seg = 7'b1001111;
+            4'h2: hex_seg = 7'b0010010;
+            4'h3: hex_seg = 7'b0000110;
+            4'h4: hex_seg = 7'b1001100;
+            4'h5: hex_seg = 7'b0100100;
+            4'h6: hex_seg = 7'b0100000;
+            4'h7: hex_seg = 7'b0001111;
+            4'h8: hex_seg = 7'b0000000;
+            4'h9: hex_seg = 7'b0000100;
+            4'hA: hex_seg = 7'b0001000;
+            4'hB: hex_seg = 7'b1100000;
+            4'hC: hex_seg = 7'b0110001;
+            4'hD: hex_seg = 7'b1000010;
+            4'hE: hex_seg = 7'b0110000;
+            4'hF: hex_seg = 7'b0111000;
+            default: hex_seg = 7'b1111111;
+        endcase
+    endfunction
+
+    // Letter constants (active low)
+    localparam SEG_P     = 7'b0011000;  // P
+    localparam SEG_r     = 7'b1111010;  // r
+    localparam SEG_o     = 7'b1000010;  // o
+    localparam SEG_DASH  = 7'b1111110;  // -
+    localparam SEG_U     = 7'b1000001;  // U
+    localparam SEG_S     = 7'b0100100;  // S
+    localparam SEG_C     = 7'b0110001;  // C
+    localparam SEG_BLANK = 7'b1111111;  // blank
+
+    wire [6:0] proto_char = (proto_sel == 2'b00) ? SEG_U :
+                            (proto_sel == 2'b01) ? SEG_S : SEG_C;
+
+    always @(*) begin
+        an            = 8'hFF;           // all digits off
+        seg           = {SEG_BLANK, 1'b1};
+        an[digit_sel] = 1'b0;            // enable current digit
+
+        case (digit_sel)
+            3'd0: seg = {hex_seg(disp_byte[3:0]), 1'b1}; // low nibble
+            3'd1: seg = {hex_seg(disp_byte[7:4]), 1'b1}; // high nibble
+            3'd2: seg = {SEG_BLANK, 1'b1};
+            3'd3: seg = {proto_char, 1'b1};               // U / S / C
+            3'd4: seg = {SEG_DASH,  1'b1};
+            3'd5: seg = {SEG_o,     1'b1};
+            3'd6: seg = {SEG_r,     1'b1};
+            3'd7: seg = {SEG_P,     1'b1};
+            default: seg = {SEG_BLANK, 1'b1};
+        endcase
+    end
+
+endmodule
