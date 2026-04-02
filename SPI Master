@@ -1,0 +1,119 @@
+`timescale 1ns / 1ps
+//=================================================================
+// SPI Master - 8-bit transfers, all 4 modes (CPOL / CPHA)
+// SCK = 100 MHz / (2 x sck_div)
+// sck_div = 50 → SCK = 1 MHz
+//=================================================================
+module spi_master (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [7:0]  sck_div,
+    input  wire        cpol,
+    input  wire        cpha,
+    input  wire [7:0]  tx_data,
+    input  wire        start,
+    output reg  [7:0]  rx_data,
+    output reg         done,
+    output reg         sck,
+    output reg         mosi,
+    input  wire        miso,
+    output reg         cs_n
+);
+
+    localparam S_IDLE     = 2'd0;
+    localparam S_TRANSFER = 2'd1;
+    localparam S_DONE     = 2'd2;
+
+    reg [1:0]  state;
+    reg [7:0]  clk_cnt;
+    reg [3:0]  half_cyc;
+    reg [7:0]  tx_reg;
+    reg [7:0]  rx_reg;
+    reg        tick;
+
+    // SCK half-period tick generator
+    always @(posedge clk) begin
+        if (rst || state != S_TRANSFER) begin
+            clk_cnt <= 8'd0;
+            tick    <= 1'b0;
+        end else begin
+            tick <= 1'b0;
+            if (clk_cnt >= sck_div - 1) begin
+                clk_cnt <= 8'd0;
+                tick    <= 1'b1;
+            end else
+                clk_cnt <= clk_cnt + 1;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state    <= S_IDLE;
+            sck      <= 1'b0;
+            mosi     <= 1'b0;
+            cs_n     <= 1'b1;
+            done     <= 1'b0;
+            half_cyc <= 4'd0;
+            tx_reg   <= 8'd0;
+            rx_reg   <= 8'd0;
+        end else begin
+            done <= 1'b0;
+
+            case (state)
+
+                S_IDLE: begin
+                    sck  <= cpol;
+                    cs_n <= 1'b1;
+                    if (start) begin
+                        tx_reg   <= tx_data;
+                        rx_reg   <= 8'd0;
+                        half_cyc <= 4'd0;
+                        cs_n     <= 1'b0;
+                        mosi     <= cpha ? 1'b0 : tx_data[7];
+                        state    <= S_TRANSFER;
+                    end
+                end
+
+                S_TRANSFER: begin
+                    if (tick) begin
+                        sck      <= ~sck;
+                        half_cyc <= half_cyc + 1;
+
+                        if (sck == cpol) begin
+                            // Leading edge
+                            if (!cpha)
+                                rx_reg <= {rx_reg[6:0], miso};
+                            else begin
+                                mosi   <= tx_reg[6];
+                                tx_reg <= {tx_reg[6:0], 1'b0};
+                            end
+                        end else begin
+                            // Trailing edge
+                            if (!cpha) begin
+                                if (half_cyc < 4'd15) begin
+                                    mosi   <= tx_reg[6];
+                                    tx_reg <= {tx_reg[6:0], 1'b0};
+                                end
+                            end else
+                                rx_reg <= {rx_reg[6:0], miso};
+                        end
+
+                        if (half_cyc == 4'd15)
+                            state <= S_DONE;
+                    end
+                end
+
+                S_DONE: begin
+                    sck     <= cpol;
+                    cs_n    <= 1'b1;
+                    rx_data <= rx_reg;
+                    done    <= 1'b1;
+                    state   <= S_IDLE;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule
