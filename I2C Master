@@ -1,0 +1,247 @@
+`timescale 1ns / 1ps
+//=================================================================
+// I2C Master - 7-bit addressing, read & write, ACK detection
+// Standard mode : 100 kHz → clk_div = 250 (100 MHz clock)
+// Fast mode     : 400 kHz → clk_div = 62
+//
+// Open-drain in top.v:
+//   assign JB1 = scl_oe ? 1'b0 : 1'bz;
+//   assign JB2 = sda_oe ? 1'b0 : 1'bz;
+//=================================================================
+module i2c_master (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [8:0]  clk_div,
+    input  wire [6:0]  addr,
+    input  wire [7:0]  wr_data,
+    input  wire        rw,
+    input  wire        start_xfer,
+    output reg  [7:0]  rd_data,
+    output reg         done,
+    output reg         ack_err,
+    output reg         scl_oe,
+    output reg         sda_oe,
+    input  wire        sda_in
+);
+
+    localparam S_IDLE       = 4'd0;
+    localparam S_START      = 4'd1;
+    localparam S_ADDR       = 4'd2;
+    localparam S_ADDR_ACK   = 4'd3;
+    localparam S_WRITE      = 4'd4;
+    localparam S_WRITE_ACK  = 4'd5;
+    localparam S_READ       = 4'd6;
+    localparam S_READ_NACK  = 4'd7;
+    localparam S_STOP       = 4'd8;
+    localparam S_DONE       = 4'd9;
+
+    reg [3:0]  state;
+    reg [8:0]  clk_cnt;
+    reg        tick;
+    reg [1:0]  phase;
+    reg [2:0]  bit_cnt;
+    reg [7:0]  shift_reg;
+    reg [7:0]  rx_shift;
+
+    // Quarter-period tick
+    always @(posedge clk) begin
+        if (rst || state == S_IDLE || state == S_DONE) begin
+            clk_cnt <= 9'd0;
+            tick    <= 1'b0;
+        end else begin
+            tick <= 1'b0;
+            if (clk_cnt >= clk_div - 1) begin
+                clk_cnt <= 9'd0;
+                tick    <= 1'b1;
+            end else
+                clk_cnt <= clk_cnt + 1;
+        end
+    end
+
+    // Phase counter 0→1→2→3 per tick
+    always @(posedge clk) begin
+        if (rst) phase <= 2'd0;
+        else if (tick) phase <= phase + 1;
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state   <= S_IDLE;
+            scl_oe  <= 1'b0;
+            sda_oe  <= 1'b0;
+            done    <= 1'b0;
+            ack_err <= 1'b0;
+            bit_cnt <= 3'd0;
+            shift_reg <= 8'd0;
+            rx_shift  <= 8'd0;
+            rd_data   <= 8'd0;
+        end else begin
+            done <= 1'b0;
+
+            case (state)
+
+                S_IDLE: begin
+                    scl_oe <= 1'b0;
+                    sda_oe <= 1'b0;
+                    if (start_xfer) begin
+                        shift_reg <= {addr, rw};
+                        bit_cnt   <= 3'd7;
+                        ack_err   <= 1'b0;
+                        state     <= S_START;
+                    end
+                end
+
+                // START: SDA falls while SCL is HIGH
+                S_START: begin
+                    if (tick) begin
+                        case (phase)
+                            2'd0: begin scl_oe <= 1'b0; sda_oe <= 1'b0; end
+                            2'd1: begin sda_oe <= 1'b1; end
+                            2'd2: begin scl_oe <= 1'b1; end
+                            2'd3: begin
+                                sda_oe <= ~shift_reg[7];
+                                state  <= S_ADDR;
+                            end
+                        endcase
+                    end
+                end
+
+                // Clock out 8 bits (7-bit addr + R/W)
+                S_ADDR: begin
+                    if (tick) begin
+                        case (phase)
+                            2'd0: scl_oe <= 1'b1;
+                            2'd1: scl_oe <= 1'b0;
+                            2'd2: ;
+                            2'd3: begin
+                                scl_oe <= 1'b1;
+                                if (bit_cnt == 3'd0) begin
+                                    sda_oe <= 1'b0;
+                                    state  <= S_ADDR_ACK;
+                                end else begin
+                                    bit_cnt   <= bit_cnt - 1;
+                                    shift_reg <= {shift_reg[6:0], 1'b0};
+                                    sda_oe    <= ~shift_reg[6];
+                                end
+                            end
+                        endcase
+                    end
+                end
+
+                // Check slave ACK after address
+                S_ADDR_ACK: begin
+                    if (tick) begin
+                        case (phase)
+                            2'd0: scl_oe <= 1'b1;
+                            2'd1: scl_oe <= 1'b0;
+                            2'd2: ack_err <= sda_in;
+                            2'd3: begin
+                                scl_oe <= 1'b1;
+                                if (!ack_err) begin
+                                    if (!rw) begin
+                                        shift_reg <= wr_data;
+                                        bit_cnt   <= 3'd7;
+                                        sda_oe    <= ~wr_data[7];
+                                        state     <= S_WRITE;
+                                    end else begin
+                                        sda_oe   <= 1'b0;
+                                        bit_cnt  <= 3'd7;
+                                        rx_shift <= 8'd0;
+                                        state    <= S_READ;
+                                    end
+                                end else
+                                    state <= S_STOP;
+                            end
+                        endcase
+                    end
+                end
+
+                // Clock out 8 data bits (write mode)
+                S_WRITE: begin
+                    if (tick) begin
+                        case (phase)
+                            2'd0: scl_oe <= 1'b1;
+                            2'd1: scl_oe <= 1'b0;
+                            2'd2: ;
+                            2'd3: begin
+                                scl_oe <= 1'b1;
+                                if (bit_cnt == 3'd0) begin
+                                    sda_oe <= 1'b0;
+                                    state  <= S_WRITE_ACK;
+                                end else begin
+                                    bit_cnt   <= bit_cnt - 1;
+                                    shift_reg <= {shift_reg[6:0], 1'b0};
+                                    sda_oe    <= ~shift_reg[6];
+                                end
+                            end
+                        endcase
+                    end
+                end
+
+                // Check slave ACK after data byte
+                S_WRITE_ACK: begin
+                    if (tick) begin
+                        case (phase)
+                            2'd0: scl_oe <= 1'b1;
+                            2'd1: scl_oe <= 1'b0;
+                            2'd2: ack_err <= sda_in;
+                            2'd3: begin scl_oe <= 1'b1; state <= S_STOP; end
+                        endcase
+                    end
+                end
+
+                // Clock in 8 data bits (read mode)
+                S_READ: begin
+                    if (tick) begin
+                        case (phase)
+                            2'd0: scl_oe <= 1'b1;
+                            2'd1: scl_oe <= 1'b0;
+                            2'd2: rx_shift <= {rx_shift[6:0], sda_in};
+                            2'd3: begin
+                                scl_oe <= 1'b1;
+                                if (bit_cnt == 3'd0) begin
+                                    rd_data <= {rx_shift[6:0], sda_in};
+                                    sda_oe  <= 1'b1;
+                                    state   <= S_READ_NACK;
+                                end else
+                                    bit_cnt <= bit_cnt - 1;
+                            end
+                        endcase
+                    end
+                end
+
+                // Send NACK after reading (single byte)
+                S_READ_NACK: begin
+                    if (tick) begin
+                        case (phase)
+                            2'd0: scl_oe <= 1'b1;
+                            2'd1: scl_oe <= 1'b0;
+                            2'd2: ;
+                            2'd3: begin scl_oe <= 1'b1; sda_oe <= 1'b1; state <= S_STOP; end
+                        endcase
+                    end
+                end
+
+                // STOP: SDA rises while SCL is HIGH
+                S_STOP: begin
+                    if (tick) begin
+                        case (phase)
+                            2'd0: begin scl_oe <= 1'b1; sda_oe <= 1'b1; end
+                            2'd1: scl_oe <= 1'b0;
+                            2'd2: sda_oe <= 1'b0;
+                            2'd3: state  <= S_DONE;
+                        endcase
+                    end
+                end
+
+                S_DONE: begin
+                    done  <= 1'b1;
+                    state <= S_IDLE;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule
