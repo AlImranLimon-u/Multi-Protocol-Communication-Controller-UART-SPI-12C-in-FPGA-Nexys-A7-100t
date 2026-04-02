@@ -1,0 +1,88 @@
+`timescale 1ns / 1ps
+//=================================================================
+// UART Transmitter - 8N1 (8 data bits, No parity, 1 Stop bit)
+// Clock : 100 MHz
+// baud_div = 100_000_000 / BAUD_RATE
+//   9600 baud   → baud_div = 10416
+//   115200 baud → baud_div = 868
+//=================================================================
+module uart_tx (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [15:0] baud_div,
+    input  wire [7:0]  data_in,
+    input  wire        send,
+    output reg         tx,
+    output reg         busy
+);
+
+    localparam S_IDLE  = 2'd0;
+    localparam S_START = 2'd1;
+    localparam S_DATA  = 2'd2;
+    localparam S_STOP  = 2'd3;
+
+    reg [1:0]  state;
+    reg [15:0] baud_cnt;
+    reg [2:0]  bit_idx;
+    reg [7:0]  shift_reg;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state    <= S_IDLE;
+            tx       <= 1'b1;
+            busy     <= 1'b0;
+            baud_cnt <= 16'd0;
+            bit_idx  <= 3'd0;
+            shift_reg<= 8'd0;
+        end else begin
+            case (state)
+
+                S_IDLE: begin
+                    tx   <= 1'b1;
+                    busy <= 1'b0;
+                    if (send) begin
+                        shift_reg <= data_in;
+                        busy      <= 1'b1;
+                        baud_cnt  <= 16'd0;
+                        state     <= S_START;
+                    end
+                end
+
+                S_START: begin
+                    tx <= 1'b0;
+                    if (baud_cnt >= baud_div - 1) begin
+                        baud_cnt <= 16'd0;
+                        bit_idx  <= 3'd0;
+                        state    <= S_DATA;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                S_DATA: begin
+                    tx <= shift_reg[0];
+                    if (baud_cnt >= baud_div - 1) begin
+                        baud_cnt  <= 16'd0;
+                        shift_reg <= {1'b0, shift_reg[7:1]};
+                        if (bit_idx == 3'd7)
+                            state <= S_STOP;
+                        else
+                            bit_idx <= bit_idx + 1;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                S_STOP: begin
+                    tx <= 1'b1;
+                    if (baud_cnt >= baud_div - 1) begin
+                        baud_cnt <= 16'd0;
+                        state    <= S_IDLE;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule
